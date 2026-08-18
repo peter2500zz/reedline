@@ -175,6 +175,15 @@ pub trait Menu: Send {
     /// Indicates how to replace in the line buffer the selected value from the menu
     fn replace_in_buffer(&self, editor: &mut Editor);
 
+    /// The value the menu currently has selected, if any.
+    ///
+    /// Lets a caller *preview* the selection without accepting it — drawing the
+    /// remainder as ghost text at the cursor, say. Defaults to `None` for menus
+    /// that keep no selection.
+    fn selected_value(&self) -> Option<Suggestion> {
+        None
+    }
+
     /// Replace the selected value in the line buffer, leaving the menu able to
     /// replace it again.
     ///
@@ -632,6 +641,10 @@ impl Menu for ReedlineMenu {
 
     fn replace_in_buffer_in_place(&self, editor: &mut Editor) {
         self.as_ref().replace_in_buffer_in_place(editor);
+    }
+
+    fn selected_value(&self) -> Option<Suggestion> {
+        self.as_ref().selected_value()
     }
 
     fn menu_required_lines(&self, terminal_columns: u16) -> u16 {

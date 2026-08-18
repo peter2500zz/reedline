@@ -4418,6 +4418,34 @@ mod tests {
         assert_eq!(reedline.current_buffer_contents(), "th");
     }
 
+    /// The selection is readable without accepting it — that is what lets a
+    /// caller draw the remainder as ghost text at the cursor.
+    #[test]
+    fn the_selection_can_be_previewed_without_accepting_it() {
+        let mut reedline = engine_with_menu_over_fixed(ide_menu());
+
+        let selected = |reedline: &Reedline| {
+            reedline
+                .menus
+                .iter()
+                .find(|menu| menu.is_active())
+                .and_then(Menu::selected_value)
+                .map(|suggestion| suggestion.value)
+        };
+
+        assert_eq!(selected(&reedline).as_deref(), Some("that"));
+        assert_eq!(
+            reedline.current_buffer_contents(),
+            "th",
+            "预览不该改动缓冲区"
+        );
+
+        send(&mut reedline, ReedlineEvent::MenuNext);
+        reedline.repaint(&DefaultPrompt::default()).unwrap();
+        assert_eq!(selected(&reedline).as_deref(), Some("this"));
+        assert_eq!(reedline.current_buffer_contents(), "th");
+    }
+
     /// Menus that do not track the buffer their suggestions came from keep the
     /// one-shot accept: the trait default forwards to `replace_in_buffer`, which
     /// declines once the line has moved on.

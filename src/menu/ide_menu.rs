@@ -838,6 +838,10 @@ impl Menu for IdeMenu {
             .accept(self.index(), editor, self.settings.output_mode);
     }
 
+    fn selected_value(&self) -> Option<Suggestion> {
+        self.get_value()
+    }
+
     /// Apply via `CompletionDisplay::accept_in_place`: rewinds to the buffer the
     /// suggestions were computed for, so repeated accepts cycle in place instead
     /// of stacking onto one another.
