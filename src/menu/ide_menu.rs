@@ -838,6 +838,14 @@ impl Menu for IdeMenu {
             .accept(self.index(), editor, self.settings.output_mode);
     }
 
+    /// Apply via `CompletionDisplay::accept_in_place`: rewinds to the buffer the
+    /// suggestions were computed for, so repeated accepts cycle in place instead
+    /// of stacking onto one another.
+    fn replace_in_buffer_in_place(&self, editor: &mut Editor) {
+        self.completions
+            .accept_in_place(self.index(), editor, self.settings.output_mode);
+    }
+
     /// Minimum rows that should be displayed by the menu
     fn min_rows(&self) -> u16 {
         self.get_rows()

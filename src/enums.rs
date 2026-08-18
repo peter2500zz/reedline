@@ -1094,6 +1094,22 @@ pub enum ReedlineEvent {
     /// Trigger a menu event. It activates a menu with the event name
     Menu(String),
 
+    /// Accept the menu's selected value into the buffer, leaving the menu open.
+    ///
+    /// Where the accept folded into [`ReedlineEvent::Enter`] closes the menu and
+    /// declines once the line has moved on, this one keeps the menu up and
+    /// applies against the buffer the suggestions were computed for. A second
+    /// accept therefore *replaces* what the first one left rather than stacking
+    /// onto it, which is what lets a single key cycle a menu: each press swaps a
+    /// different suggestion into the same spot.
+    ///
+    /// Pair it with [`ReedlineEvent::MenuNext`] to advance first, or send it
+    /// alone to take the selection as it stands.
+    ///
+    /// Editing the line reloads the menu against the new text, so cycling can
+    /// never rewind over something that was typed in the meantime.
+    MenuAccept,
+
     /// Next element in the menu
     MenuNext,
 

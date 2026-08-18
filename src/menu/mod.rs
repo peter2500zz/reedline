@@ -175,6 +175,18 @@ pub trait Menu: Send {
     /// Indicates how to replace in the line buffer the selected value from the menu
     fn replace_in_buffer(&self, editor: &mut Editor);
 
+    /// Replace the selected value in the line buffer, leaving the menu able to
+    /// replace it again.
+    ///
+    /// Drives [`ReedlineEvent::MenuAccept`]. The default forwards to
+    /// [`Self::replace_in_buffer`], which suits menus whose accept is one-shot.
+    /// A menu that remembers the buffer its suggestions were computed against
+    /// can override this to apply there instead, so repeated accepts cycle in
+    /// place rather than stack up.
+    fn replace_in_buffer_in_place(&self, editor: &mut Editor) {
+        self.replace_in_buffer(editor);
+    }
+
     /// Calculates the real required lines for the menu considering how many lines
     /// wrap the terminal or if entries have multiple lines
     fn menu_required_lines(&self, terminal_columns: u16) -> u16;
@@ -616,6 +628,10 @@ impl Menu for ReedlineMenu {
 
     fn replace_in_buffer(&self, editor: &mut Editor) {
         self.as_ref().replace_in_buffer(editor);
+    }
+
+    fn replace_in_buffer_in_place(&self, editor: &mut Editor) {
+        self.as_ref().replace_in_buffer_in_place(editor);
     }
 
     fn menu_required_lines(&self, terminal_columns: u16) -> u16 {

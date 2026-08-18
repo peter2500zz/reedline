@@ -1403,6 +1403,7 @@ impl Reedline {
             | ReedlineEvent::Menu(_)
             | ReedlineEvent::MenuNext
             | ReedlineEvent::MenuPrevious
+            | ReedlineEvent::MenuAccept
             | ReedlineEvent::MenuUp
             | ReedlineEvent::MenuDown
             | ReedlineEvent::MenuLeft
@@ -1483,6 +1484,28 @@ impl Reedline {
                         menu.menu_event(MenuEvent::PreviousElement);
                         Ok(EventStatus::Handled)
                     })
+            }
+            ReedlineEvent::MenuAccept => {
+                match self.menus.iter_mut().find(|menu| menu.is_active()) {
+                    Some(menu) => {
+                        // A selection move sent earlier in this same batch — a
+                        // keybinding that pairs `MenuNext` with this event to cycle —
+                        // has not landed yet: menus record the event and act on it
+                        // when their working details are next updated, which normally
+                        // happens at paint time. Flush it first so the value accepted
+                        // is the one the user sees selected, not the one before the
+                        // move.
+                        menu.update_working_details(
+                            &mut self.editor,
+                            self.completer.as_mut(),
+                            self.history.as_ref(),
+                            &self.painter,
+                        );
+                        menu.replace_in_buffer_in_place(&mut self.editor);
+                        Ok(EventStatus::Handled)
+                    }
+                    None => Ok(EventStatus::Inapplicable),
+                }
             }
             ReedlineEvent::MenuUp => {
                 self.active_menu()
@@ -2673,8 +2696,8 @@ mod tests {
     use super::*;
     use crate::terminal_extensions::semantic_prompt::PromptKind;
     use crate::{
-        ColumnarMenu, CompletionOrigin, CompletionResult, DefaultPrompt, MenuBuilder, PromptViMode,
-        Span, Suggestion,
+        ColumnarMenu, CompletionOrigin, CompletionResult, DefaultPrompt, IdeMenu, MenuBuilder,
+        PromptViMode, Span, Suggestion,
     };
     use rstest::rstest;
 
@@ -4248,6 +4271,172 @@ mod tests {
         assert!(
             menu.is_awaiting_first_answer(),
             "it would only be taken away again once the real answer lands"
+        );
+    }
+
+    /// A completer whose answer never varies: every suggestion replaces the whole
+    /// line, so what lands in the buffer names the suggestion that was accepted.
+    struct FixedCompleter(Vec<String>);
+
+    impl Completer for FixedCompleter {
+        fn complete(&mut self, _line: &str, pos: usize) -> CompletionResult {
+            CompletionResult::fresh(
+                self.0
+                    .iter()
+                    .map(|value| Suggestion {
+                        value: value.clone(),
+                        span: Span { start: 0, end: pos },
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    /// Engine with `menu` open over three suggestions and "th" typed.
+    fn engine_with_menu_over_fixed(menu: ReedlineMenu) -> Reedline {
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(FixedCompleter(
+                ["that", "this", "those"]
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            )))
+            .with_menu(menu);
+
+        // Accepting repaints the menu's working details, which needs a painter
+        // that believes it is on a terminal.
+        reedline.painter.handle_resize(80, 24);
+        reedline.painter.force_prompt_anchored_for_test(0);
+
+        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
+        reedline
+            .handle_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Menu(String::from("completion_menu")),
+            )
+            .unwrap();
+        assert!(menu_is_active(&reedline), "setup: the menu is open");
+
+        // One repaint, as the next real keystroke would arrive after: it applies
+        // the queued Activate, so the menu starts out open *and* populated. Menus
+        // keep only the latest queued event, so without this the first move would
+        // overwrite the activation and the menu would never load its values.
+        reedline.repaint(&DefaultPrompt::default()).unwrap();
+        reedline
+    }
+
+    fn ide_menu() -> ReedlineMenu {
+        ReedlineMenu::EngineCompleter(Box::new(IdeMenu::default().with_name("completion_menu")))
+    }
+
+    fn send(reedline: &mut Reedline, event: ReedlineEvent) -> EventStatus {
+        reedline
+            .handle_event(&DefaultPrompt::default(), event)
+            .unwrap()
+    }
+
+    /// The point of the event: repeated accepts replace one another instead of
+    /// stacking up, so pairing it with `MenuNext` walks the line through the
+    /// suggestions. Without the in-place apply the second accept would find the
+    /// line changed underneath its spans and decline, leaving "that" in place.
+    #[test]
+    fn menu_accept_cycles_in_place() {
+        let mut reedline = engine_with_menu_over_fixed(ide_menu());
+
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+        assert_eq!(reedline.current_buffer_contents(), "that");
+
+        send(&mut reedline, ReedlineEvent::MenuNext);
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+        assert_eq!(reedline.current_buffer_contents(), "this");
+
+        send(&mut reedline, ReedlineEvent::MenuNext);
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+        assert_eq!(reedline.current_buffer_contents(), "those");
+    }
+
+    /// A move and an accept sent in one batch — what a Tab binding emits — must
+    /// accept the value the move landed on. Menus record the move and act on it
+    /// when their working details next update, so the accept has to flush it
+    /// first or it takes the selection from before the move.
+    #[test]
+    fn menu_accept_sees_a_move_sent_in_the_same_batch() {
+        let mut reedline = engine_with_menu_over_fixed(ide_menu());
+
+        send(
+            &mut reedline,
+            ReedlineEvent::Multiple(vec![ReedlineEvent::MenuNext, ReedlineEvent::MenuAccept]),
+        );
+
+        assert_eq!(reedline.current_buffer_contents(), "this");
+    }
+
+    /// Unlike the accept folded into `Enter`, this one leaves the menu up —
+    /// otherwise there would be nothing left to cycle.
+    #[test]
+    fn menu_accept_keeps_the_menu_open() {
+        let mut reedline = engine_with_menu_over_fixed(ide_menu());
+
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+
+        assert!(menu_is_active(&reedline));
+    }
+
+    /// The rewind may only ever undo a previous accept. Typing reloads the menu
+    /// against the new line, which re-stamps the origin — so an accept after an
+    /// edit builds on what was typed rather than throwing it away.
+    #[test]
+    fn an_edit_between_accepts_moves_the_origin() {
+        let mut reedline = engine_with_menu_over_fixed(ide_menu());
+
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+        assert_eq!(reedline.current_buffer_contents(), "that");
+
+        // Typing goes through the menu's Edit event, which reloads the suggestions.
+        send(
+            &mut reedline,
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('!')]),
+        );
+        assert_eq!(reedline.current_buffer_contents(), "that!");
+
+        // The span now covers "that!", so accepting replaces that, not "th".
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+        assert_eq!(reedline.current_buffer_contents(), "that");
+    }
+
+    /// With no menu open the event must do nothing at all. A binding that reached
+    /// the accept through `Enter` instead would submit the line here.
+    #[test]
+    fn menu_accept_does_nothing_without_an_open_menu() {
+        let mut reedline = Reedline::create();
+        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
+
+        let status = send(&mut reedline, ReedlineEvent::MenuAccept);
+
+        assert!(matches!(status, EventStatus::Inapplicable));
+        assert_eq!(reedline.current_buffer_contents(), "th");
+    }
+
+    /// Menus that do not track the buffer their suggestions came from keep the
+    /// one-shot accept: the trait default forwards to `replace_in_buffer`, which
+    /// declines once the line has moved on.
+    #[test]
+    fn a_menu_without_the_override_keeps_the_one_shot_accept() {
+        let columnar = ReedlineMenu::EngineCompleter(Box::new(
+            ColumnarMenu::default().with_name("completion_menu"),
+        ));
+        let mut reedline = engine_with_menu_over_fixed(columnar);
+
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+        assert_eq!(reedline.current_buffer_contents(), "that");
+
+        send(&mut reedline, ReedlineEvent::MenuNext);
+        send(&mut reedline, ReedlineEvent::MenuAccept);
+        assert_eq!(
+            reedline.current_buffer_contents(),
+            "that",
+            "the default accept is one-shot"
         );
     }
 

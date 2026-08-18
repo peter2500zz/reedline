@@ -511,6 +511,33 @@ impl CompletionDisplay {
         }
     }
 
+    /// Accept suggestion at index against the buffer the spans describe, rather
+    /// than the live one.
+    ///
+    /// [`Self::accept`] declines once the line has moved on, which is what a
+    /// one-shot accept wants. This one first rewinds the line to the origin the
+    /// suggestions were computed for, so a second accept replaces what the first
+    /// one left instead of stacking onto it — the difference between cycling a
+    /// menu and appending to it.
+    ///
+    /// The rewind only ever undoes a previous accept: an `Activate` or `Edit`
+    /// event reloads the suggestions and stamps a fresh origin, so anything
+    /// typed while the menu is open moves the origin forward with it.
+    pub fn accept_in_place(
+        &self,
+        index: usize,
+        editor: &mut Editor,
+        output_mode: Option<OutputMode>,
+    ) {
+        if !self.is_current(editor) {
+            editor.set_buffer(
+                self.computed_for.buffer.clone(),
+                UndoBehavior::CreateUndoPoint,
+            );
+        }
+        replace_in_buffer(self.values.get(index).cloned(), editor, output_mode);
+    }
+
     /// Apply partial completion (completer-supplied or derived). No-op and returns false when stale or unchanged.
     pub fn common_prefix(&self, editor: &mut Editor) -> bool {
         if !self.is_current(editor) {
