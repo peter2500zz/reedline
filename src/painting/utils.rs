@@ -95,17 +95,92 @@ pub(crate) fn line_width(line: &str) -> usize {
     strip_ansi(line).width()
 }
 
+/// Cursor position after printing text, relative to a prompt-local origin.
+///
+/// `column == terminal_columns` represents the terminal's deferred-wrap state:
+/// the last glyph filled the row, but no following glyph has made the cursor
+/// advance yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrintedCursorPosition {
+    pub(crate) column: u16,
+    pub(crate) row: u16,
+    pub(crate) pending_wrap: bool,
+}
+
+impl PrintedCursorPosition {
+    pub(crate) const fn origin() -> Self {
+        Self {
+            column: 0,
+            row: 0,
+            pending_wrap: false,
+        }
+    }
+
+    /// The cell a terminal cursor physically occupies. In deferred-wrap state
+    /// the logical insertion point is one column past the margin, while the
+    /// visible cursor remains on the last cell of the row.
+    pub(crate) fn physical_column(self, terminal_columns: u16) -> u16 {
+        if self.pending_wrap {
+            terminal_columns.saturating_sub(1)
+        } else {
+            self.column.min(terminal_columns.saturating_sub(1))
+        }
+    }
+}
+
+/// Advance `position` through ANSI-styled text the same way a terminal does.
+pub(crate) fn advance_printed_cursor_position<'a>(
+    position: PrintedCursorPosition,
+    pieces: impl IntoIterator<Item = &'a str>,
+    terminal_columns: u16,
+) -> PrintedCursorPosition {
+    let columns: usize = terminal_columns.into();
+    if columns == 0 {
+        return PrintedCursorPosition::origin();
+    }
+
+    let (mut row, mut col) = (position.row, usize::from(position.column));
+    for piece in pieces {
+        for grapheme in strip_ansi(piece).graphemes(true) {
+            match grapheme {
+                "\n" => (row, col) = (row.saturating_add(1), 0),
+                "\r" => col = 0,
+                _ => {
+                    let width = grapheme.width();
+                    if col >= columns || col + width > columns {
+                        (row, col) = (row.saturating_add(1), 0);
+                    }
+                    col += width;
+                }
+            }
+        }
+    }
+
+    PrintedCursorPosition {
+        column: col.min(u16::MAX as usize) as u16,
+        row,
+        pending_wrap: col >= columns,
+    }
+}
+
+/// Cursor position after printing a run from a prompt-local origin.
+pub(crate) fn printed_cursor_position<'a>(
+    pieces: impl IntoIterator<Item = &'a str>,
+    terminal_columns: u16,
+) -> PrintedCursorPosition {
+    advance_printed_cursor_position(PrintedCursorPosition::origin(), pieces, terminal_columns)
+}
+
 /// Where printing `pieces` leaves the cursor, when it lands on the terminal's
 /// right margin in the *deferred wrap* state.
 ///
 /// A terminal does not move to the next row when a glyph lands in the final
 /// column; it flags the cursor pending and only wraps once the next glyph
 /// arrives. Terminals disagree about whether DECSC/DECRC carry that flag, so a
-/// save taken there restores to either side of the margin and the caller has to
-/// place the cursor absolutely instead. Returns how many rows past the start of
-/// the run that row is, or `None` off the margin, where restoring is already
-/// unambiguous. `pieces` are laid out end to end, since the walk is a fold and
-/// never looks backwards.
+/// cursor move taken there reaches the same visible cell but cannot recreate
+/// the pending flag. Returns how many rows past the start of the run the
+/// deferred destination represents, or `None` off the margin. `pieces` are
+/// laid out end to end, since the walk is a fold and never looks backwards.
 ///
 /// Counted a grapheme at a time rather than by dividing the run's width, which
 /// [`estimate_required_lines`] and friends still do. A double-width grapheme
@@ -118,37 +193,10 @@ pub(crate) fn deferred_wrap_row<'a>(
     pieces: impl IntoIterator<Item = &'a str>,
     terminal_columns: u16,
 ) -> Option<u16> {
-    let columns: usize = terminal_columns.into();
-    if columns == 0 {
-        return None;
-    }
-
-    // `col == columns` *is* the deferred wrap: the run has filled the row but
-    // nothing has arrived to push it over yet.
-    let (mut row, mut col) = (0u16, 0usize);
-    for piece in pieces {
-        for grapheme in strip_ansi(piece).graphemes(true) {
-            match grapheme {
-                "\n" => (row, col) = (row.saturating_add(1), 0),
-                "\r" => col = 0,
-                _ => {
-                    let width = grapheme.width();
-                    // The wrap this grapheme's arrival was deferred until.
-                    if col >= columns {
-                        (row, col) = (row.saturating_add(1), 0);
-                    }
-                    // No room for the whole grapheme: the trailing column stays
-                    // blank and the terminal wraps before drawing it.
-                    if col + width > columns {
-                        (row, col) = (row.saturating_add(1), 0);
-                    }
-                    col += width;
-                }
-            }
-        }
-    }
-
-    (col >= columns).then(|| row.saturating_add(1))
+    let position = printed_cursor_position(pieces, terminal_columns);
+    position
+        .pending_wrap
+        .then(|| position.row.saturating_add(1))
 }
 
 #[cfg(test)]
@@ -241,6 +289,42 @@ mod test {
         #[case] expected: Option<u16>,
     ) {
         assert_eq!(deferred_wrap_row([printed], columns), expected);
+    }
+
+    #[test]
+    fn advancing_starts_at_the_supplied_local_position() {
+        let start = PrintedCursorPosition {
+            column: 3,
+            row: 2,
+            pending_wrap: false,
+        };
+
+        assert_eq!(
+            advance_printed_cursor_position(start, ["ab\r\nxyz"], 10),
+            PrintedCursorPosition {
+                column: 3,
+                row: 3,
+                pending_wrap: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_printable_grapheme_materializes_a_deferred_wrap() {
+        let margin = PrintedCursorPosition {
+            column: 5,
+            row: 1,
+            pending_wrap: true,
+        };
+
+        assert_eq!(
+            advance_printed_cursor_position(margin, ["x"], 5),
+            PrintedCursorPosition {
+                column: 1,
+                row: 2,
+                pending_wrap: false,
+            }
+        );
     }
 
     /// Regression: no-color rendering strips ANSI bytes before CRLF coercion,
