@@ -163,14 +163,6 @@ pub(crate) fn advance_printed_cursor_position<'a>(
     }
 }
 
-/// Cursor position after printing a run from a prompt-local origin.
-pub(crate) fn printed_cursor_position<'a>(
-    pieces: impl IntoIterator<Item = &'a str>,
-    terminal_columns: u16,
-) -> PrintedCursorPosition {
-    advance_printed_cursor_position(PrintedCursorPosition::origin(), pieces, terminal_columns)
-}
-
 /// Where printing `pieces` leaves the cursor, when it lands on the terminal's
 /// right margin in the *deferred wrap* state.
 ///
@@ -189,11 +181,13 @@ pub(crate) fn printed_cursor_position<'a>(
 /// exact rows ending on the margin, when the terminal needs three and leaves
 /// the cursor mid-row. That is the difference between restoring the cursor and
 /// moving it somewhere it never was.
+#[cfg(test)]
 pub(crate) fn deferred_wrap_row<'a>(
     pieces: impl IntoIterator<Item = &'a str>,
     terminal_columns: u16,
 ) -> Option<u16> {
-    let position = printed_cursor_position(pieces, terminal_columns);
+    let position =
+        advance_printed_cursor_position(PrintedCursorPosition::origin(), pieces, terminal_columns);
     position
         .pending_wrap
         .then(|| position.row.saturating_add(1))
