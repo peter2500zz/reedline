@@ -1458,7 +1458,8 @@ impl Reedline {
                 Ok(EventStatus::Inapplicable)
             }
             ReedlineEvent::MenuNext => {
-                if let Some(menu) = self.menus.iter_mut().find(|menu| menu.is_active()) {
+                if let Some(index) = self.settle_active_menu_event() {
+                    let menu = &mut self.menus[index];
                     // The second route to the lone-value accept, so it carries the same
                     // provisional guard as `decide_menu_completion`: accepting a lone
                     // *stale* value is refused downstream, but the `Enter` would still
@@ -1487,15 +1488,15 @@ impl Reedline {
                 }
             }
             ReedlineEvent::MenuPrevious => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::PreviousElement);
+                self.settle_active_menu_event()
+                    .map_or(Ok(EventStatus::Inapplicable), |index| {
+                        self.menus[index].menu_event(MenuEvent::PreviousElement);
                         Ok(EventStatus::Handled)
                     })
             }
             ReedlineEvent::MenuAccept => {
-                match self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    Some(menu) => {
+                match self.settle_active_menu_event() {
+                    Some(index) => {
                         // A selection move sent earlier in this same batch — a
                         // keybinding that pairs `MenuNext` with this event to cycle —
                         // has not landed yet: menus record the event and act on it
@@ -1503,68 +1504,58 @@ impl Reedline {
                         // happens at paint time. Flush it first so the value accepted
                         // is the one the user sees selected, not the one before the
                         // move.
-                        menu.update_working_details(
-                            &mut self.editor,
-                            self.completer.as_mut(),
-                            self.history.as_ref(),
-                            &self.painter,
-                        );
-                        menu.replace_in_buffer_in_place(&mut self.editor);
+                        self.menus[index].replace_in_buffer_in_place(&mut self.editor);
                         Ok(EventStatus::Handled)
                     }
                     None => Ok(EventStatus::Inapplicable),
                 }
             }
             ReedlineEvent::MenuUp => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveUp);
+                self.settle_active_menu_event()
+                    .map_or(Ok(EventStatus::Inapplicable), |index| {
+                        self.menus[index].menu_event(MenuEvent::MoveUp);
                         Ok(EventStatus::Handled)
                     })
             }
             ReedlineEvent::MenuDown => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveDown);
+                self.settle_active_menu_event()
+                    .map_or(Ok(EventStatus::Inapplicable), |index| {
+                        self.menus[index].menu_event(MenuEvent::MoveDown);
                         Ok(EventStatus::Handled)
                     })
             }
             ReedlineEvent::MenuLeft => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveLeft);
+                self.settle_active_menu_event()
+                    .map_or(Ok(EventStatus::Inapplicable), |index| {
+                        self.menus[index].menu_event(MenuEvent::MoveLeft);
                         Ok(EventStatus::Handled)
                     })
             }
             ReedlineEvent::MenuRight => {
-                self.active_menu()
-                    .map_or(Ok(EventStatus::Inapplicable), |menu| {
-                        menu.menu_event(MenuEvent::MoveRight);
+                self.settle_active_menu_event()
+                    .map_or(Ok(EventStatus::Inapplicable), |index| {
+                        self.menus[index].menu_event(MenuEvent::MoveRight);
                         Ok(EventStatus::Handled)
                     })
             }
-            // These two spell out `active_menu()`, since that borrows all of `self` and
-            // the painter has to stay reachable alongside the menu.
-            ReedlineEvent::MenuPageNext => {
-                match self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    Some(menu) => {
-                        menu.menu_event(MenuEvent::NextPage);
-                        invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
-                        Ok(EventStatus::Handled)
-                    }
-                    None => Ok(EventStatus::Inapplicable),
+            ReedlineEvent::MenuPageNext => match self.settle_active_menu_event() {
+                Some(index) => {
+                    let menu = &mut self.menus[index];
+                    menu.menu_event(MenuEvent::NextPage);
+                    invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
+                    Ok(EventStatus::Handled)
                 }
-            }
-            ReedlineEvent::MenuPagePrevious => {
-                match self.menus.iter_mut().find(|menu| menu.is_active()) {
-                    Some(menu) => {
-                        menu.menu_event(MenuEvent::PreviousPage);
-                        invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
-                        Ok(EventStatus::Handled)
-                    }
-                    None => Ok(EventStatus::Inapplicable),
+                None => Ok(EventStatus::Inapplicable),
+            },
+            ReedlineEvent::MenuPagePrevious => match self.settle_active_menu_event() {
+                Some(index) => {
+                    let menu = &mut self.menus[index];
+                    menu.menu_event(MenuEvent::PreviousPage);
+                    invalidate_anchor_if_host_completer_runs(menu, &mut self.painter);
+                    Ok(EventStatus::Handled)
                 }
-            }
+                None => Ok(EventStatus::Inapplicable),
+            },
             ReedlineEvent::HistoryHintComplete => {
                 let hint = self.hinter.as_mut().map(|h| h.complete_hint());
                 Ok(self.accept_history_hint(hint))
@@ -1607,15 +1598,12 @@ impl Reedline {
             ReedlineEvent::Enter | ReedlineEvent::Submit | ReedlineEvent::SubmitOrNewline
                 if self.menus.iter().any(|menu| menu.is_active()) =>
             {
-                for menu in self.menus.iter_mut() {
-                    if menu.is_active() {
-                        menu.replace_in_buffer(&mut self.editor);
-                        menu.menu_event(MenuEvent::Deactivate);
-
-                        return Ok(EventStatus::Handled);
-                    }
-                }
-                unreachable!()
+                let index = self
+                    .settle_active_menu_event()
+                    .expect("the match guard found an active menu");
+                self.menus[index].replace_in_buffer(&mut self.editor);
+                self.menus[index].menu_event(MenuEvent::Deactivate);
+                Ok(EventStatus::Handled)
             }
             ReedlineEvent::Enter => {
                 #[cfg(feature = "bashisms")]
@@ -1851,6 +1839,31 @@ impl Reedline {
 
     fn active_menu(&mut self) -> Option<&mut ReedlineMenu> {
         self.menus.iter_mut().find(|menu| menu.is_active())
+    }
+
+    /// Apply the active menu's previously queued event before another menu
+    /// action is allowed to replace it.
+    ///
+    /// Menus intentionally defer their work until layout is available, but
+    /// their queue has a single slot. Input batching can therefore place an
+    /// `Edit` and a movement in that slot before the next repaint. Settling the
+    /// older event here preserves the ordering of user actions and, crucially,
+    /// refreshes completion origins before an in-place accept can rewind to one.
+    fn settle_active_menu_event(&mut self) -> Option<usize> {
+        let index = self.menus.iter().position(|menu| menu.is_active())?;
+        // `read_line` initializes terminal geometry before it can receive input.
+        // Some engine-level callers and tests drive events before that boundary;
+        // there is no usable layout to settle in that state, and columnar menus
+        // legitimately divide the screen width among their columns.
+        if self.painter.screen_width() != 0 {
+            self.menus[index].update_working_details(
+                &mut self.editor,
+                self.completer.as_mut(),
+                self.history.as_ref(),
+                &self.painter,
+            );
+        }
+        Some(index)
     }
 
     fn deactivate_menus(&mut self) {
@@ -2530,16 +2543,18 @@ impl Reedline {
 
         // Updating the working details of the active menu
         if mode == BufferPaintMode::Interactive {
+            let regular_indicator = lines.prompt_indicator.clone();
             for menu in self.menus.iter_mut() {
                 if menu.is_active() {
-                    // A menu still waiting on its first answer stays off screen, so a Tab
-                    // resolving to one suggestion never draws a menu it takes away again.
-                    if menu.is_visible() {
-                        lines.prompt_indicator = menu.indicator().to_owned().into();
-                    }
-                    // If the menu requires the cursor position, update it (ide menu)
-                    let cursor_pos = lines.cursor_pos(self.painter.screen_width());
-                    menu.set_cursor_pos(cursor_pos);
+                    // Give a queued event geometry based on the state that is currently
+                    // on screen. Applying that event below may open or hide the menu.
+                    lines.prompt_indicator = if menu.is_visible() {
+                        menu.indicator().to_owned().into()
+                    } else {
+                        regular_indicator.clone()
+                    };
+                    let previous_cursor_pos = lines.cursor_pos(self.painter.screen_width());
+                    menu.set_cursor_pos(previous_cursor_pos);
 
                     menu.update_working_details(
                         &mut self.editor,
@@ -2548,14 +2563,23 @@ impl Reedline {
                         &self.painter,
                     );
 
-                    // That update is where a first answer lands and ends the opening phase,
-                    // so ask again: the painter picks the menu to draw below, and an
-                    // indicator saying otherwise would draw its rows under the ordinary
-                    // prompt. Reading it twice is the price of the loop: the indicator sets
-                    // the prompt width that positions the cursor, which the update consumes,
-                    // so on the frame a menu opens that width lags by one paint.
-                    if menu.is_visible() {
-                        lines.prompt_indicator = menu.indicator().to_owned().into();
+                    // Visibility, the painted indicator, and menu geometry must describe
+                    // one frame. If applying the queued event changed the indicator width,
+                    // recompute the cursor-dependent layout once with the settled prompt.
+                    lines.prompt_indicator = if menu.is_visible() {
+                        menu.indicator().to_owned().into()
+                    } else {
+                        regular_indicator.clone()
+                    };
+                    let settled_cursor_pos = lines.cursor_pos(self.painter.screen_width());
+                    if settled_cursor_pos != previous_cursor_pos {
+                        menu.set_cursor_pos(settled_cursor_pos);
+                        menu.update_working_details(
+                            &mut self.editor,
+                            self.completer.as_mut(),
+                            self.history.as_ref(),
+                            &self.painter,
+                        );
                     }
                 }
             }
@@ -4426,6 +4450,180 @@ mod tests {
         );
     }
 
+    /// Test menu whose queued activation opens it and whose next edit hides it.
+    /// Cursor positions expose which prompt indicator the engine used for menu
+    /// geometry without coupling the assertion to terminal escape sequences.
+    struct VisibilityFlipMenu {
+        settings: crate::menu::MenuSettings,
+        active: bool,
+        awaiting: bool,
+        event: Option<MenuEvent>,
+        cursor_positions: Arc<std::sync::Mutex<Vec<(u16, u16)>>>,
+        values: Vec<Suggestion>,
+    }
+
+    impl VisibilityFlipMenu {
+        fn new() -> (Self, Arc<std::sync::Mutex<Vec<(u16, u16)>>>) {
+            let cursor_positions = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    settings: crate::menu::MenuSettings::default()
+                        .with_name("completion_menu")
+                        .with_marker("| "),
+                    active: false,
+                    awaiting: true,
+                    event: None,
+                    cursor_positions: Arc::clone(&cursor_positions),
+                    values: vec![Suggestion::default()],
+                },
+                cursor_positions,
+            )
+        }
+    }
+
+    impl Menu for VisibilityFlipMenu {
+        fn settings(&self) -> &crate::menu::MenuSettings {
+            &self.settings
+        }
+
+        fn is_active(&self) -> bool {
+            self.active
+        }
+
+        fn set_active(&mut self, active: bool) {
+            self.active = active;
+        }
+
+        fn clear_input(&mut self) {}
+
+        fn menu_event(&mut self, event: MenuEvent) {
+            self.handle_menu_event(&event);
+            self.event = Some(event);
+        }
+
+        fn can_quick_complete(&self) -> bool {
+            false
+        }
+
+        fn can_partially_complete(
+            &mut self,
+            _values_updated: bool,
+            _editor: &mut Editor,
+            _completer: &mut dyn Completer,
+        ) -> bool {
+            false
+        }
+
+        fn update_values(&mut self, _editor: &mut Editor, _completer: &mut dyn Completer) {}
+
+        fn reset_position(&mut self) {}
+
+        fn update_working_details(
+            &mut self,
+            _editor: &mut Editor,
+            _completer: &mut dyn Completer,
+            _painter: &Painter,
+        ) {
+            if let Some(event) = self.event.take() {
+                match event {
+                    MenuEvent::Activate(_) => self.awaiting = false,
+                    MenuEvent::Edit(_) => self.awaiting = true,
+                    _ => {}
+                }
+            }
+        }
+
+        fn replace_in_buffer(&self, _editor: &mut Editor) {}
+
+        fn menu_required_lines(&self, _terminal_columns: u16) -> u16 {
+            1
+        }
+
+        fn menu_string(&self, _available_lines: u16, _use_ansi_coloring: bool) -> String {
+            "candidate".to_owned()
+        }
+
+        fn min_rows(&self) -> u16 {
+            1
+        }
+
+        fn get_values(&self) -> &[Suggestion] {
+            &self.values
+        }
+
+        fn is_awaiting_first_answer(&self) -> bool {
+            self.awaiting
+        }
+
+        fn set_cursor_pos(&mut self, pos: (u16, u16)) {
+            self.cursor_positions.lock().unwrap().push(pos);
+        }
+    }
+
+    struct LongIndicatorPrompt;
+
+    impl Prompt for LongIndicatorPrompt {
+        fn render_prompt_left(&self) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+
+        fn render_prompt_right(&self) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+
+        fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
+            Cow::Borrowed("demo> ")
+        }
+
+        fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+            Cow::Borrowed("... ")
+        }
+
+        fn render_prompt_history_search_indicator(&self, _: PromptHistorySearch) -> Cow<'_, str> {
+            Cow::Borrowed("(search) ")
+        }
+    }
+
+    fn visibility_flip_engine() -> (Reedline, Arc<std::sync::Mutex<Vec<(u16, u16)>>>) {
+        let (menu, cursor_positions) = VisibilityFlipMenu::new();
+        let mut reedline =
+            Reedline::create().with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)));
+        reedline.painter.handle_resize(80, 24);
+        reedline.painter.force_prompt_anchored_for_test(0);
+        reedline
+            .editor
+            .set_buffer("x".to_owned(), UndoBehavior::CreateUndoPoint);
+        send(
+            &mut reedline,
+            ReedlineEvent::Menu("completion_menu".to_owned()),
+        );
+        (reedline, cursor_positions)
+    }
+
+    #[test]
+    fn opening_menu_geometry_uses_the_indicator_painted_in_the_same_frame() {
+        let (mut reedline, cursor_positions) = visibility_flip_engine();
+
+        reedline.repaint(&LongIndicatorPrompt).unwrap();
+
+        assert_eq!(cursor_positions.lock().unwrap().last(), Some(&(3, 0)));
+    }
+
+    #[test]
+    fn hiding_menu_restores_the_regular_indicator_in_the_same_frame() {
+        let (mut reedline, cursor_positions) = visibility_flip_engine();
+        reedline.repaint(&LongIndicatorPrompt).unwrap();
+        cursor_positions.lock().unwrap().clear();
+        send(
+            &mut reedline,
+            ReedlineEvent::Edit(vec![EditCommand::InsertChar('!')]),
+        );
+
+        reedline.repaint(&LongIndicatorPrompt).unwrap();
+
+        assert_eq!(cursor_positions.lock().unwrap().last(), Some(&(8, 0)));
+    }
+
     /// A completer whose answer never varies: every suggestion replaces the whole
     /// line, so what lands in the buffer names the suggestion that was accepted.
     struct FixedCompleter(Vec<String>);
@@ -4442,6 +4640,29 @@ mod tests {
                     })
                     .collect::<Vec<_>>(),
             )
+        }
+    }
+
+    /// Offers the fixed values only for the exact line the menu was opened on.
+    /// Once the user types anything else, a refreshed menu must be empty.
+    struct ExactLineCompleter {
+        line: &'static str,
+        values: Vec<String>,
+    }
+
+    impl Completer for ExactLineCompleter {
+        fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+            let values = (line == self.line)
+                .then_some(&self.values)
+                .into_iter()
+                .flatten()
+                .map(|value| Suggestion {
+                    value: value.clone(),
+                    span: Span { start: 0, end: pos },
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            CompletionResult::fresh(values)
         }
     }
 
@@ -4522,6 +4743,45 @@ mod tests {
         );
 
         assert_eq!(reedline.current_buffer_contents(), "this");
+    }
+
+    /// A later menu movement in the same input batch must not overwrite the
+    /// pending `Edit` that refreshes completion spans. Otherwise the in-place
+    /// accept rewinds to the old origin and silently drops what the user typed.
+    #[test]
+    fn menu_move_cannot_overwrite_the_edit_before_an_in_place_accept() {
+        let mut reedline = Reedline::create()
+            .with_completer(Box::new(ExactLineCompleter {
+                line: "th",
+                values: ["that", "this", "those"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            }))
+            .with_menu(ide_menu());
+        reedline.painter.handle_resize(80, 24);
+        reedline.painter.force_prompt_anchored_for_test(0);
+        reedline.run_edit_commands(&[EditCommand::InsertString("th".to_owned())]);
+        send(
+            &mut reedline,
+            ReedlineEvent::Menu("completion_menu".to_owned()),
+        );
+        reedline.repaint(&DefaultPrompt::default()).unwrap();
+
+        send(
+            &mut reedline,
+            ReedlineEvent::Multiple(vec![
+                ReedlineEvent::Edit(vec![EditCommand::InsertChar('!')]),
+                ReedlineEvent::MenuDown,
+                ReedlineEvent::MenuAccept,
+            ]),
+        );
+
+        assert_eq!(
+            reedline.current_buffer_contents(),
+            "th!",
+            "the stale menu origin discarded the edit"
+        );
     }
 
     /// Unlike the accept folded into `Enter`, this one leaves the menu up —
