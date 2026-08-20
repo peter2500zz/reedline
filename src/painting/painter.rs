@@ -282,11 +282,35 @@ impl PromptStartRow {
     }
 }
 
+/// Whether querying the terminal for an absolute cursor position is currently
+/// usable.
+///
+/// A tty can exist without a terminal emulator on the other end answering CPR
+/// (`CSI 6 n`). Docker/Compose attach pipelines are one example. Treat that as
+/// a missing terminal capability rather than as a fatal input error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorPositionSupport {
+    /// No query has completed yet.
+    Unknown,
+    /// The most recent query succeeded.
+    Supported,
+    /// The most recent query failed. Normal paints must not pay the synchronous
+    /// timeout again; infrequent resizes may explicitly retry.
+    Unsupported,
+}
+
+impl CursorPositionSupport {
+    fn should_query(self, retry_unsupported: bool) -> bool {
+        self != Self::Unsupported || retry_unsupported
+    }
+}
+
 /// Implementation of the output to the terminal
 pub struct Painter {
     // Stdout
     stdout: W,
     prompt_start_row: PromptStartRow,
+    cursor_position_support: CursorPositionSupport,
     // The number of lines that the prompt takes up
     prompt_height: u16,
     terminal_size: (u16, u16),
@@ -305,6 +329,7 @@ impl Painter {
         Painter {
             stdout,
             prompt_start_row: PromptStartRow::Unverified,
+            cursor_position_support: CursorPositionSupport::Unknown,
             prompt_height: 0,
             terminal_size: (0, 0),
             last_required_lines: 0,
@@ -462,27 +487,64 @@ impl Painter {
         }
     }
 
-    /// Sets the prompt origin position and screen size for a new line editor
-    /// invocation
+    fn update_terminal_size(&mut self, size: (u16, u16)) {
+        // Some non-compliant terminals report (0, 0). Keep the established
+        // fallback so layout arithmetic never divides by zero.
+        self.terminal_size = if size == (0, 0) { (80, 24) } else { size };
+    }
+
+    /// Query the cursor when the current capability state permits it.
     ///
-    /// Not to be used for resizes during a running line editor, use
-    /// [`Painter::handle_resize()`] instead
-    pub(crate) fn initialize_prompt_position(
+    /// Cursor queries are advisory for painting. Other terminal I/O still
+    /// returns its errors normally; only a missing CPR response is downgraded
+    /// to an unavailable capability here.
+    fn query_cursor_position(&mut self, retry_unsupported: bool) -> Option<(u16, u16)> {
+        if !self.cursor_position_support.should_query(retry_unsupported) {
+            return None;
+        }
+
+        let result = cursor::position();
+        self.record_cursor_position_result(result)
+    }
+
+    fn record_cursor_position_result(&mut self, result: Result<(u16, u16)>) -> Option<(u16, u16)> {
+        match result {
+            Ok(position) => {
+                self.cursor_position_support = CursorPositionSupport::Supported;
+                Some(position)
+            }
+            Err(_) => {
+                self.cursor_position_support = CursorPositionSupport::Unsupported;
+                None
+            }
+        }
+    }
+
+    /// Establish an absolute anchor without CPR.
+    ///
+    /// The bottom row is the only conservative absolute position we can claim
+    /// after an untracked writer or attach pipeline has owned the tty. Existing
+    /// repaint logic will scroll upward from it when a multi-row prompt or menu
+    /// needs space. When entering a fresh `read_line`, preserve a possible
+    /// partial host line before taking ownership of the bottom row.
+    fn establish_fallback_anchor(&mut self, preserve_current_line: bool) -> Result<()> {
+        if preserve_current_line {
+            self.stdout.queue(Print("\r\n"))?;
+        }
+
+        let bottom_row = self.screen_height().saturating_sub(1);
+        self.stdout.queue(MoveTo(0, bottom_row))?.flush()?;
+        self.prompt_start_row.mark_verified(bottom_row);
+        self.just_resized = false;
+        Ok(())
+    }
+
+    fn select_and_store_prompt_position(
         &mut self,
         suspended_state: Option<&PainterSuspendedState>,
+        position: (u16, u16),
     ) -> Result<()> {
-        // Update the terminal size
-        self.terminal_size = {
-            let size = terminal::size()?;
-            // if reported size is 0, 0 -
-            // use a default size to avoid divide by 0 panics
-            if size == (0, 0) {
-                (80, 24)
-            } else {
-                size
-            }
-        };
-        let prompt_selector = select_prompt_row(suspended_state, cursor::position()?);
+        let prompt_selector = select_prompt_row(suspended_state, position);
         let new_row = match prompt_selector {
             PromptRowSelector::UseExistingPrompt { start_row } => start_row,
             PromptRowSelector::MakeNewPrompt { new_row } => {
@@ -503,6 +565,24 @@ impl Painter {
         // drift-detection call to cursor::position().
         self.prompt_start_row.mark_verified(new_row);
         Ok(())
+    }
+
+    /// Sets the prompt origin position and screen size for a new line editor
+    /// invocation
+    ///
+    /// Not to be used for resizes during a running line editor, use
+    /// [`Painter::handle_resize()`] instead
+    pub(crate) fn initialize_prompt_position(
+        &mut self,
+        suspended_state: Option<&PainterSuspendedState>,
+    ) -> Result<()> {
+        // Update the terminal size
+        self.update_terminal_size(terminal::size()?);
+
+        match self.query_cursor_position(false) {
+            Some(position) => self.select_and_store_prompt_position(suspended_state, position),
+            None => self.establish_fallback_anchor(true),
+        }
     }
 
     /// Mark `prompt_start_row` as possibly out of sync — the next
@@ -568,11 +648,17 @@ impl Painter {
             // homing to row 0, which would yank the prompt to the top. The `+1`
             // allows for output that left the cursor on the prompt row.
             // See nushell/reedline#1130.
-            let anchor = match cursor::position() {
-                Ok((_, cursor_row)) if cursor_row + 1 < row => cursor_row,
-                _ => row,
-            };
-            self.prompt_start_row.mark_verified(anchor);
+            match self.query_cursor_position(false) {
+                Some((_, cursor_row)) => {
+                    let anchor = if cursor_row + 1 < row {
+                        cursor_row
+                    } else {
+                        row
+                    };
+                    self.prompt_start_row.mark_verified(anchor);
+                }
+                None => self.establish_fallback_anchor(false)?,
+            }
         }
 
         // Unreachable in normal flow (initialize_prompt_position runs first);
@@ -1136,6 +1222,7 @@ impl Painter {
         self.terminal_size = (width, height);
 
         self.invalidate_prompt_start_row();
+        self.just_resized = false;
 
         // `cursor::position()` is blocking and can time out, but a
         // resize happens infrequently enough that we accept the cost.
@@ -1148,7 +1235,11 @@ impl Painter {
         // bug.
         #[cfg(not(test))]
         {
-            if let Ok(position) = cursor::position() {
+            // Resize is also the best signal available when a new terminal
+            // client attaches to an existing pty. Retry CPR here even after an
+            // earlier timeout; success restores precise positioning, while a
+            // failure leaves the next repaint in the safe fallback mode.
+            if let Some(position) = self.query_cursor_position(true) {
                 self.prompt_start_row = PromptStartRow::Stale(position.1);
                 self.just_resized = true;
             }
@@ -1182,7 +1273,10 @@ impl Painter {
             .queue(Clear(ClearType::All))?
             .queue(MoveTo(0, 0))?
             .flush()?;
-        self.initialize_prompt_position(None)
+        self.update_terminal_size(terminal::size()?);
+        self.prompt_start_row.mark_verified(0);
+        self.just_resized = false;
+        Ok(())
     }
 
     pub(crate) fn clear_scrollback(&mut self) -> Result<()> {
@@ -1191,7 +1285,10 @@ impl Painter {
             .queue(Clear(ClearType::Purge))?
             .queue(MoveTo(0, 0))?
             .flush()?;
-        self.initialize_prompt_position(None)
+        self.update_terminal_size(terminal::size()?);
+        self.prompt_start_row.mark_verified(0);
+        self.just_resized = false;
+        Ok(())
     }
 
     /// Park the cursor below the entry on the way out of `read_line`.
@@ -1272,14 +1369,14 @@ impl Painter {
         // batch of messages, not per message, so the flicker the comment above
         // guards against is unaffected.
         self.stdout.flush()?;
-        self.prompt_start_row = match cursor::position() {
+        self.prompt_start_row = match self.query_cursor_position(false) {
             // Measured, so later paints can skip the drift check.
-            Ok((_, actual)) => PromptStartRow::Verified(actual),
+            Some((_, actual)) => PromptStartRow::Verified(actual),
             // No answer, so all that is left is the count this function stopped
             // trusting. `Stale` at least keeps the next paint checking it;
             // `Verified` would skip the check and paint against a row the
             // terminal may never have reached.
-            Err(_) => PromptStartRow::Stale(row),
+            None => PromptStartRow::Stale(row),
         };
         Ok(())
     }
