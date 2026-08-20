@@ -688,9 +688,20 @@ impl Painter {
         match position {
             Some(position) => self.select_and_store_prompt_position(suspended_state, position),
             None => {
-                let preserve_current_line = suspended_state.is_some()
-                    || self.relative_cursor_position.is_none()
-                    || matches!(self.prompt_start_row, PromptStartRow::Stale(_));
+                // Like prompt-toolkit, a fresh renderer treats the tty's current
+                // position as its local origin. Hosts normally finish any output
+                // before calling `read_line`; forcing a CRLF here would therefore
+                // manufacture an empty line in line-oriented logs such as Docker
+                // Compose's. Keep the conservative line preservation for later
+                // re-anchoring, where another program or a resize may genuinely
+                // have left the cursor in an untracked position.
+                let initial_prompt = suspended_state.is_none()
+                    && self.relative_cursor_position.is_none()
+                    && self.prompt_start_row == PromptStartRow::Unverified;
+                let preserve_current_line = !initial_prompt
+                    && (suspended_state.is_some()
+                        || self.relative_cursor_position.is_none()
+                        || matches!(self.prompt_start_row, PromptStartRow::Stale(_)));
                 self.establish_fallback_origin(preserve_current_line)
             }
         }
@@ -1732,7 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_cursor_query_failure_preserves_the_host_line_and_anchors_at_bottom() {
+    fn initial_cursor_query_failure_adopts_the_current_line_without_output() {
         let mut painter = Painter::new(W::capture());
         painter.update_terminal_size((20, 10));
         let position = painter.record_cursor_position_result(Err(std::io::Error::other("no CPR")));
@@ -1743,7 +1754,7 @@ mod tests {
 
         assert_eq!(painter.prompt_start_row, PromptStartRow::Verified(9));
         let output = String::from_utf8_lossy(painter.stdout.captured());
-        assert_eq!(output, "\r\n");
+        assert_eq!(output, "");
         assert_no_frame_crossing_controls(&output, "CPR fallback initialization");
     }
 
