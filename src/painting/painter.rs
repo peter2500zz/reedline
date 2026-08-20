@@ -567,6 +567,30 @@ impl Painter {
         Ok(())
     }
 
+    fn finish_prompt_position_initialization(
+        &mut self,
+        suspended_state: Option<&PainterSuspendedState>,
+        position: Option<(u16, u16)>,
+    ) -> Result<()> {
+        match position {
+            Some(position) => self.select_and_store_prompt_position(suspended_state, position),
+            None => self.establish_fallback_anchor(true),
+        }
+    }
+
+    fn reset_after_clear(&mut self, terminal_size: (u16, u16)) {
+        self.update_terminal_size(terminal_size);
+        self.prompt_start_row.mark_verified(0);
+        self.just_resized = false;
+    }
+
+    fn apply_resize_cursor_position(&mut self, position: Option<(u16, u16)>) {
+        if let Some((_, row)) = position {
+            self.prompt_start_row = PromptStartRow::Stale(row);
+            self.just_resized = true;
+        }
+    }
+
     /// Sets the prompt origin position and screen size for a new line editor
     /// invocation
     ///
@@ -579,10 +603,8 @@ impl Painter {
         // Update the terminal size
         self.update_terminal_size(terminal::size()?);
 
-        match self.query_cursor_position(false) {
-            Some(position) => self.select_and_store_prompt_position(suspended_state, position),
-            None => self.establish_fallback_anchor(true),
-        }
+        let position = self.query_cursor_position(false);
+        self.finish_prompt_position_initialization(suspended_state, position)
     }
 
     /// Mark `prompt_start_row` as possibly out of sync — the next
@@ -1239,10 +1261,8 @@ impl Painter {
             // client attaches to an existing pty. Retry CPR here even after an
             // earlier timeout; success restores precise positioning, while a
             // failure leaves the next repaint in the safe fallback mode.
-            if let Some(position) = self.query_cursor_position(true) {
-                self.prompt_start_row = PromptStartRow::Stale(position.1);
-                self.just_resized = true;
-            }
+            let position = self.query_cursor_position(true);
+            self.apply_resize_cursor_position(position);
         }
     }
 
@@ -1273,9 +1293,7 @@ impl Painter {
             .queue(Clear(ClearType::All))?
             .queue(MoveTo(0, 0))?
             .flush()?;
-        self.update_terminal_size(terminal::size()?);
-        self.prompt_start_row.mark_verified(0);
-        self.just_resized = false;
+        self.reset_after_clear(terminal::size()?);
         Ok(())
     }
 
@@ -1285,9 +1303,7 @@ impl Painter {
             .queue(Clear(ClearType::Purge))?
             .queue(MoveTo(0, 0))?
             .flush()?;
-        self.update_terminal_size(terminal::size()?);
-        self.prompt_start_row.mark_verified(0);
-        self.just_resized = false;
+        self.reset_after_clear(terminal::size()?);
         Ok(())
     }
 
@@ -1563,6 +1579,159 @@ mod tests {
             select_prompt_row(Some(&state), (3, 12)),
             PromptRowSelector::UseExistingPrompt { start_row: 11 }
         );
+    }
+
+    #[test]
+    fn cursor_position_failure_is_cached_but_a_resize_can_recover() {
+        let mut painter = Painter::new(W::sink());
+
+        assert!(
+            painter.cursor_position_support.should_query(false),
+            "the first read_line must probe CPR"
+        );
+        assert_eq!(
+            painter.record_cursor_position_result(Err(std::io::Error::other("no CPR"))),
+            None
+        );
+        assert_eq!(
+            painter.cursor_position_support,
+            CursorPositionSupport::Unsupported
+        );
+        assert!(
+            !painter.cursor_position_support.should_query(false),
+            "steady-state paints must not repeat the synchronous timeout"
+        );
+        assert!(
+            painter.cursor_position_support.should_query(true),
+            "a resize may retry after a terminal client attaches"
+        );
+
+        assert_eq!(
+            painter.record_cursor_position_result(Ok((4, 7))),
+            Some((4, 7))
+        );
+        assert_eq!(
+            painter.cursor_position_support,
+            CursorPositionSupport::Supported
+        );
+    }
+
+    #[test]
+    fn initial_cursor_query_failure_preserves_the_host_line_and_anchors_at_bottom() {
+        let mut painter = Painter::new(W::capture());
+        painter.update_terminal_size((20, 10));
+        let position = painter.record_cursor_position_result(Err(std::io::Error::other("no CPR")));
+
+        painter
+            .finish_prompt_position_initialization(None, position)
+            .expect("fallback initialization failed");
+
+        assert_eq!(painter.prompt_start_row, PromptStartRow::Verified(9));
+        assert_eq!(
+            String::from_utf8_lossy(painter.stdout.captured()),
+            "\r\n\x1b[10;1H"
+        );
+    }
+
+    #[test]
+    fn a_known_clear_position_does_not_reenable_or_query_cpr() {
+        let mut painter = Painter::new(W::sink());
+        painter.record_cursor_position_result(Err(std::io::Error::other("no CPR")));
+        painter.prompt_start_row = PromptStartRow::Stale(8);
+        painter.just_resized = true;
+
+        painter.reset_after_clear((20, 10));
+
+        assert_eq!(painter.prompt_start_row, PromptStartRow::Verified(0));
+        assert_eq!(
+            painter.cursor_position_support,
+            CursorPositionSupport::Unsupported
+        );
+        assert!(!painter.just_resized);
+    }
+
+    #[test]
+    fn a_successful_resize_retry_restores_a_precise_stale_anchor() {
+        let mut painter = Painter::new(W::sink());
+        painter.record_cursor_position_result(Err(std::io::Error::other("no CPR")));
+        painter.prompt_start_row.mark_verified(4);
+        painter.invalidate_prompt_start_row();
+
+        let position = painter.record_cursor_position_result(Ok((6, 12)));
+        painter.apply_resize_cursor_position(position);
+
+        assert_eq!(
+            painter.cursor_position_support,
+            CursorPositionSupport::Supported
+        );
+        assert_eq!(painter.prompt_start_row, PromptStartRow::Stale(12));
+        assert!(painter.just_resized);
+    }
+
+    #[test]
+    fn a_stale_anchor_without_cpr_is_rehomed_before_a_full_repaint() {
+        let mut painter = Painter::new(W::capture());
+        painter.terminal_size = (20, 10);
+        painter.cursor_position_support = CursorPositionSupport::Unsupported;
+        painter.prompt_start_row = PromptStartRow::Stale(3);
+        let lines = make_lines("> ", "", "RP", "one\ntwo\nthree", "");
+
+        painter
+            .repaint_buffer(
+                &TestPrompt,
+                &lines,
+                PromptEditMode::Emacs,
+                None,
+                false,
+                &None,
+            )
+            .expect("fallback repaint failed");
+
+        let required_lines = painter.last_required_lines;
+        assert!(required_lines > 1);
+        assert_eq!(
+            painter.prompt_start_row,
+            PromptStartRow::Verified(10 - required_lines)
+        );
+        assert!(
+            String::from_utf8_lossy(painter.stdout.captured()).contains("\x1b[10;1H"),
+            "fallback must first take ownership of the known bottom row"
+        );
+    }
+
+    #[cfg(feature = "external_printer")]
+    #[test]
+    fn external_print_without_cpr_rehomes_on_the_following_repaint() {
+        let mut painter = Painter::new(W::capture());
+        painter.terminal_size = (20, 10);
+        painter.cursor_position_support = CursorPositionSupport::Unsupported;
+        painter.prompt_start_row.mark_verified(5);
+
+        painter
+            .print_external_message(
+                vec!["background notice".to_owned()],
+                &LineBuffer::default(),
+                &TestPrompt,
+            )
+            .expect("external print failed");
+        assert_eq!(painter.prompt_start_row, PromptStartRow::Stale(6));
+
+        let lines = make_lines("> ", "", "", "", "");
+        painter
+            .repaint_buffer(
+                &TestPrompt,
+                &lines,
+                PromptEditMode::Emacs,
+                None,
+                false,
+                &None,
+            )
+            .expect("fallback repaint failed");
+
+        assert_eq!(painter.prompt_start_row, PromptStartRow::Verified(9));
+        let output = String::from_utf8_lossy(painter.stdout.captured());
+        assert!(output.contains("background notice"));
+        assert!(output.contains("\x1b[10;1H"));
     }
 
     // Regression test for nushell/reedline#1130.
