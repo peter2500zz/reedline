@@ -27,6 +27,17 @@ pub trait Highlighter: Send {
     /// Cursor position as byte offsets in the string
     fn highlight(&self, line: &str, cursor: usize) -> StyledText;
 
+    /// Highlight a line immediately before it becomes terminal scrollback.
+    ///
+    /// Interactive-only decorations such as virtual text should be omitted from
+    /// this rendering. The default keeps existing highlighters source-compatible
+    /// and reuses their ordinary highlighting.
+    ///
+    /// Cursor position is a byte offset in the string.
+    fn highlight_final(&self, line: &str, cursor: usize) -> StyledText {
+        self.highlight(line, cursor)
+    }
+
     /// Returns `true` if an abbreviation should be expanded at the given cursor position
     /// (a byte offset into `line`), `false` if expansion should be suppressed
     ///

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::ControlFlow, path::PathBuf};
+use std::{borrow::Cow, collections::HashMap, ops::ControlFlow, path::PathBuf};
 
 use itertools::Itertools;
 use nu_ansi_term::{Color, Style};
@@ -93,6 +93,14 @@ enum InputMode {
     /// Either bash style up/down history or fish style prefix search,
     /// Edits directly switch to [`InputMode::Regular`]
     HistoryTraversal,
+}
+
+/// Whether a buffer paint is an editable frame or the copy about to become
+/// terminal scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferPaintMode {
+    Interactive,
+    Final,
 }
 
 /// Configuration for mouse click-to-cursor support.
@@ -1580,6 +1588,7 @@ impl Reedline {
                 }
             }
             ReedlineEvent::CtrlC => {
+                self.buffer_paint(prompt, BufferPaintMode::Final)?;
                 self.deactivate_menus();
                 self.run_edit_commands(&[EditCommand::Clear]);
                 self.editor.reset_undo_stack();
@@ -2110,7 +2119,7 @@ impl Reedline {
         if self.input_mode == InputMode::HistorySearch {
             self.history_search_paint(prompt)
         } else {
-            self.buffer_paint(prompt)
+            self.buffer_paint(prompt, BufferPaintMode::Interactive)
         }
     }
 
@@ -2445,13 +2454,18 @@ impl Reedline {
     /// Triggers a full repaint including the prompt parts
     ///
     /// Includes the highlighting and hinting calls.
-    fn buffer_paint(&mut self, prompt: &dyn Prompt) -> Result<()> {
+    fn buffer_paint(&mut self, prompt: &dyn Prompt, mode: BufferPaintMode) -> Result<()> {
         let cursor_position_in_buffer = self.editor.insertion_point();
         let buffer_to_paint = self.editor.get_buffer();
 
-        let mut styled_text = self
-            .highlighter
-            .highlight(buffer_to_paint, cursor_position_in_buffer);
+        let mut styled_text = match mode {
+            BufferPaintMode::Interactive => self
+                .highlighter
+                .highlight(buffer_to_paint, cursor_position_in_buffer),
+            BufferPaintMode::Final => self
+                .highlighter
+                .highlight_final(buffer_to_paint, cursor_position_in_buffer),
+        };
         if let Some((from, to)) = self.editor.get_selection() {
             // With a cursor-cell style configured, the head cell gets it and
             // the selection style covers the rest of the range.
@@ -2479,7 +2493,7 @@ impl Reedline {
             self.painter.semantic_markers(),
         );
 
-        let hint: String = if self.hints_active() {
+        let hint: String = if mode == BufferPaintMode::Interactive && self.hints_active() {
             self.hinter.as_mut().map_or_else(String::new, |hinter| {
                 hinter.handle(
                     buffer_to_paint,
@@ -2510,38 +2524,48 @@ impl Reedline {
             &hint,
         );
 
+        if mode == BufferPaintMode::Final {
+            lines.prompt_str_right = Cow::Borrowed("");
+        }
+
         // Updating the working details of the active menu
-        for menu in self.menus.iter_mut() {
-            if menu.is_active() {
-                // A menu still waiting on its first answer stays off screen, so a Tab
-                // resolving to one suggestion never draws a menu it takes away again.
-                if menu.is_visible() {
-                    lines.prompt_indicator = menu.indicator().to_owned().into();
-                }
-                // If the menu requires the cursor position, update it (ide menu)
-                let cursor_pos = lines.cursor_pos(self.painter.screen_width());
-                menu.set_cursor_pos(cursor_pos);
+        if mode == BufferPaintMode::Interactive {
+            for menu in self.menus.iter_mut() {
+                if menu.is_active() {
+                    // A menu still waiting on its first answer stays off screen, so a Tab
+                    // resolving to one suggestion never draws a menu it takes away again.
+                    if menu.is_visible() {
+                        lines.prompt_indicator = menu.indicator().to_owned().into();
+                    }
+                    // If the menu requires the cursor position, update it (ide menu)
+                    let cursor_pos = lines.cursor_pos(self.painter.screen_width());
+                    menu.set_cursor_pos(cursor_pos);
 
-                menu.update_working_details(
-                    &mut self.editor,
-                    self.completer.as_mut(),
-                    self.history.as_ref(),
-                    &self.painter,
-                );
+                    menu.update_working_details(
+                        &mut self.editor,
+                        self.completer.as_mut(),
+                        self.history.as_ref(),
+                        &self.painter,
+                    );
 
-                // That update is where a first answer lands and ends the opening phase,
-                // so ask again: the painter picks the menu to draw below, and an
-                // indicator saying otherwise would draw its rows under the ordinary
-                // prompt. Reading it twice is the price of the loop: the indicator sets
-                // the prompt width that positions the cursor, which the update consumes,
-                // so on the frame a menu opens that width lags by one paint.
-                if menu.is_visible() {
-                    lines.prompt_indicator = menu.indicator().to_owned().into();
+                    // That update is where a first answer lands and ends the opening phase,
+                    // so ask again: the painter picks the menu to draw below, and an
+                    // indicator saying otherwise would draw its rows under the ordinary
+                    // prompt. Reading it twice is the price of the loop: the indicator sets
+                    // the prompt width that positions the cursor, which the update consumes,
+                    // so on the frame a menu opens that width lags by one paint.
+                    if menu.is_visible() {
+                        lines.prompt_indicator = menu.indicator().to_owned().into();
+                    }
                 }
             }
         }
 
-        let menu = self.menus.iter().find(|menu| menu.is_visible());
+        let menu = if mode == BufferPaintMode::Interactive {
+            self.menus.iter().find(|menu| menu.is_visible())
+        } else {
+            None
+        };
 
         self.painter.repaint_buffer(
             prompt,
@@ -2552,7 +2576,7 @@ impl Reedline {
             &self.cursor_shapes,
         )?;
 
-        if self.mouse_click_mode.is_enabled() {
+        if mode == BufferPaintMode::Interactive && self.mouse_click_mode.is_enabled() {
             if let Some(layout) = &self.painter.last_layout {
                 let buffer = self.editor.get_buffer();
                 let (raw_before, raw_after) = buffer.split_at(cursor_position_in_buffer);
@@ -2658,12 +2682,12 @@ impl Reedline {
     fn submit_buffer(&mut self, prompt: &dyn Prompt) -> io::Result<EventStatus> {
         let buffer = self.editor.get_buffer().to_string();
         self.hide_hints = true;
-        // Additional repaint to show the content without hints etc.
+        // Additional repaint to leave only committed content in scrollback.
         if let Some(transient_prompt) = self.transient_prompt.take() {
-            self.repaint(transient_prompt.as_ref())?;
+            self.buffer_paint(transient_prompt.as_ref(), BufferPaintMode::Final)?;
             self.transient_prompt = Some(transient_prompt);
         } else {
-            self.repaint(prompt)?;
+            self.buffer_paint(prompt, BufferPaintMode::Final)?;
         }
         if !buffer.is_empty() {
             let mut entry = HistoryItem::from_command_line(&buffer);
@@ -2697,7 +2721,7 @@ mod tests {
     use crate::terminal_extensions::semantic_prompt::PromptKind;
     use crate::{
         ColumnarMenu, CompletionOrigin, CompletionResult, DefaultPrompt, IdeMenu, MenuBuilder,
-        PromptViMode, Span, Suggestion,
+        PromptViMode, Span, StyledText, Suggestion,
     };
     use rstest::rstest;
 
@@ -2719,6 +2743,134 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn unstyled(text: impl Into<String>) -> StyledText {
+        let mut styled = StyledText::new();
+        styled.push((Style::new(), text.into()));
+        styled
+    }
+
+    /// Models an application highlighter that inserts virtual text at the
+    /// cursor while the line is editable.
+    struct VirtualTextHighlighter;
+
+    impl Highlighter for VirtualTextHighlighter {
+        fn highlight(&self, line: &str, cursor: usize) -> StyledText {
+            let (before, after) = line.split_at(cursor);
+            unstyled(format!("{before}VIRTUAL{after}"))
+        }
+
+        fn highlight_final(&self, line: &str, _: usize) -> StyledText {
+            unstyled(line)
+        }
+    }
+
+    struct DecoratedPrompt;
+
+    impl Prompt for DecoratedPrompt {
+        fn render_prompt_left(&self) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+
+        fn render_prompt_right(&self) -> Cow<'_, str> {
+            Cow::Borrowed("RIGHT_PROMPT")
+        }
+
+        fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
+            Cow::Borrowed("> ")
+        }
+
+        fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+            Cow::Borrowed("| ")
+        }
+
+        fn render_prompt_history_search_indicator(&self, _: PromptHistorySearch) -> Cow<'_, str> {
+            Cow::Borrowed("(search) ")
+        }
+    }
+
+    struct DecorativeHinter;
+
+    impl Hinter for DecorativeHinter {
+        fn handle(&mut self, _: &str, _: usize, _: &dyn History, _: bool, _: &str) -> String {
+            "INLINE_HINT".to_owned()
+        }
+
+        fn complete_hint(&self) -> String {
+            "INLINE_HINT".to_owned()
+        }
+
+        fn next_hint_token(&self) -> String {
+            "INLINE_HINT".to_owned()
+        }
+    }
+
+    fn final_paint_engine(line: &str, cursor: usize) -> Reedline {
+        let mut rl = Reedline::create()
+            .with_highlighter(Box::new(VirtualTextHighlighter))
+            .with_hinter(Box::new(DecorativeHinter))
+            .with_ansi_colors(false);
+        rl.painter = Painter::new(W::capture());
+        rl.painter.handle_resize(80, 24);
+        rl.painter.force_prompt_anchored_for_test(0);
+        rl.editor
+            .set_buffer(line.to_owned(), UndoBehavior::CreateUndoPoint);
+        rl.editor.edit_buffer(
+            |buffer| buffer.set_insertion_point(cursor),
+            UndoBehavior::MoveCursor,
+        );
+        rl
+    }
+
+    fn captured_output(rl: &Reedline) -> String {
+        String::from_utf8_lossy(rl.painter.captured_output_for_test()).into_owned()
+    }
+
+    #[test]
+    fn submitted_line_omits_interactive_decorations() {
+        // Keep real text after the cursor to distinguish it from virtual text:
+        // final painting must retain `!` while dropping the inserted marker.
+        let mut rl = final_paint_engine("ec!", 2);
+        let status = rl.submit_buffer(&DecoratedPrompt).expect("submit");
+
+        assert!(matches!(
+            status,
+            EventStatus::Exits(Signal::Success(ref line)) if line == "ec!"
+        ));
+        let output = captured_output(&rl);
+        assert!(
+            output.contains("> ec!"),
+            "real input was not painted: {output:?}"
+        );
+        for decoration in ["VIRTUAL", "INLINE_HINT", "RIGHT_PROMPT"] {
+            assert!(
+                !output.contains(decoration),
+                "final paint leaked {decoration}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_freezes_the_real_line_without_interactive_decorations() {
+        let mut rl = final_paint_engine("ec", 2);
+        let status = rl
+            .handle_event(&DecoratedPrompt, ReedlineEvent::CtrlC)
+            .expect("Ctrl-C");
+        assert!(matches!(status, EventStatus::Exits(Signal::CtrlC)));
+        rl.painter.move_cursor_to_end().expect("park cursor");
+
+        let output = captured_output(&rl);
+        assert!(
+            output.contains("> ec"),
+            "aborted input was not painted: {output:?}"
+        );
+        for decoration in ["VIRTUAL", "INLINE_HINT", "RIGHT_PROMPT"] {
+            assert!(
+                !output.contains(decoration),
+                "Ctrl-C paint leaked {decoration}: {output:?}"
+            );
+        }
     }
 
     /// Drive each key as its own input batch, so vi mode transitions settle

@@ -1541,6 +1541,11 @@ impl Painter {
         self.prompt_start_row = PromptStartRow::Verified(row);
     }
 
+    #[cfg(test)]
+    pub(crate) fn captured_output_for_test(&self) -> &[u8] {
+        self.stdout.captured()
+    }
+
     /// Whether the cached anchor is still trusted, so a test can pin which events cost
     /// a re-verify and which keep #1090's query-free path.
     #[cfg(test)]
