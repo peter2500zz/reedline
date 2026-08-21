@@ -4453,17 +4453,19 @@ mod tests {
     /// Test menu whose queued activation opens it and whose next edit hides it.
     /// Cursor positions expose which prompt indicator the engine used for menu
     /// geometry without coupling the assertion to terminal escape sequences.
+    type CursorPositions = Arc<std::sync::Mutex<Vec<(u16, u16)>>>;
+
     struct VisibilityFlipMenu {
         settings: crate::menu::MenuSettings,
         active: bool,
         awaiting: bool,
         event: Option<MenuEvent>,
-        cursor_positions: Arc<std::sync::Mutex<Vec<(u16, u16)>>>,
+        cursor_positions: CursorPositions,
         values: Vec<Suggestion>,
     }
 
     impl VisibilityFlipMenu {
-        fn new() -> (Self, Arc<std::sync::Mutex<Vec<(u16, u16)>>>) {
+        fn new() -> (Self, CursorPositions) {
             let cursor_positions = Arc::new(std::sync::Mutex::new(Vec::new()));
             (
                 Self {
@@ -4584,7 +4586,7 @@ mod tests {
         }
     }
 
-    fn visibility_flip_engine() -> (Reedline, Arc<std::sync::Mutex<Vec<(u16, u16)>>>) {
+    fn visibility_flip_engine() -> (Reedline, CursorPositions) {
         let (menu, cursor_positions) = VisibilityFlipMenu::new();
         let mut reedline =
             Reedline::create().with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)));
