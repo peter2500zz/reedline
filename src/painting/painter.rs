@@ -562,6 +562,17 @@ impl Painter {
         let width = self.screen_width().max(1);
         let original = *current;
         let mut current_column = original.physical_column(width);
+        if original.pending_wrap {
+            // Terminals disagree whether the first CUB step from deferred wrap
+            // moves a cell or only clears the wrap state. Round-trip through a
+            // neighboring cell first so later movement starts from the same
+            // physical column under either convention.
+            if current_column > 0 {
+                self.stdout.queue(MoveLeft(1))?.queue(MoveRight(1))?;
+            } else {
+                self.stdout.queue(MoveRight(1))?.queue(MoveLeft(1))?;
+            }
+        }
         if to.row > original.row {
             for _ in original.row..to.row {
                 self.stdout.queue(Print("\r\n"))?;
@@ -575,15 +586,6 @@ impl Painter {
             self.stdout.queue(MoveLeft(current_column - to.column))?;
         } else if to.column > current_column {
             self.stdout.queue(MoveRight(to.column - current_column))?;
-        } else if original.pending_wrap && to.row == original.row {
-            // Any cursor movement clears the terminal's deferred-wrap flag.
-            // Keep the visible cell unchanged without using a carriage return,
-            // which would cross a stream multiplexer prefix.
-            if current_column > 0 {
-                self.stdout.queue(MoveLeft(1))?.queue(MoveRight(1))?;
-            } else {
-                self.stdout.queue(MoveRight(1))?.queue(MoveLeft(1))?;
-            }
         }
         *current = to;
         Ok(())
