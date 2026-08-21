@@ -2210,11 +2210,21 @@ mod tests {
         rows: Vec<String>,
     }
 
+    fn replay(bytes: &str, width: u16, save_carries_pending: bool) -> Replayed {
+        replay_with_pending_wrap_cub(bytes, width, save_carries_pending, false)
+    }
+
     /// Replay `bytes` into a character grid.
     ///
-    /// `save_carries_pending` picks which way DECSC/DECRC treat a deferred wrap,
-    /// so the same stream can be read as either kind of terminal would.
-    fn replay(bytes: &str, width: u16, save_carries_pending: bool) -> Replayed {
+    /// `save_carries_pending` picks which way DECSC/DECRC treat a deferred wrap.
+    /// `pending_wrap_consumes_cub_step` models terminals where the first CUB
+    /// step only clears pending wrap instead of moving one physical cell.
+    fn replay_with_pending_wrap_cub(
+        bytes: &str,
+        width: u16,
+        save_carries_pending: bool,
+        pending_wrap_consumes_cub_step: bool,
+    ) -> Replayed {
         fn put(r: u16, c: u16, ch: char, width: u16, g: &mut Vec<Vec<char>>) {
             while g.len() <= r as usize {
                 g.push(vec![' '; width as usize]);
@@ -2268,7 +2278,14 @@ mod tests {
                             'A' => row = row.saturating_sub(amount),
                             'B' => row = row.saturating_add(amount),
                             'C' => col = col.saturating_add(amount).min(width.saturating_sub(1)),
-                            'D' => col = col.saturating_sub(amount),
+                            'D' => {
+                                let amount = if pending && pending_wrap_consumes_cub_step {
+                                    amount.saturating_sub(1)
+                                } else {
+                                    amount
+                                };
+                                col = col.saturating_sub(amount);
+                            }
                             _ => unreachable!(),
                         }
                         pending = false;
@@ -2497,6 +2514,20 @@ mod tests {
     /// existence; past one row it counts only the first line. A short first line
     /// therefore leaves room for the right prompt while the last line still
     /// fills the width, which is exactly when the return position is pending.
+    #[test]
+    fn a_right_prompt_round_trip_survives_cub_consuming_pending_wrap() {
+        let lines = make_lines("", "demo> ", "R", "he1", "");
+        let (out, _, _) = capture_repaint(&lines, 0);
+
+        let xterm = replay(&out, 20, false);
+        let pending_step = replay_with_pending_wrap_cub(&out, 20, false, true);
+
+        assert_eq!(
+            pending_step.cursor, xterm.cursor,
+            "right-prompt return depends on how CUB treats pending wrap; emitted {out:?}"
+        );
+    }
+
     #[test]
     fn a_right_prompt_paint_pins_the_cursor_too() {
         // 20 columns: a 2-column first line, a second that fills the width.
